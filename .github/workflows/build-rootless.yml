@@ -2,6 +2,18 @@ name: Build AppSync Unified (Rootless)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/build-rootless.yml"
+      - "Makefile"
+      - "control"
+      - "AppSyncUnified-FrontBoard/**"
+      - "AppSyncUnified-installd/**"
+      - "asu_inject/**"
+      - "pkg-actions/**"
+      - "layout/**"
 
 permissions:
   contents: read
@@ -16,8 +28,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Cache Theos and iPhoneOS SDK
-        uses: actions/cache@v4
+      - name: Restore Theos and iPhoneOS SDK cache
+        id: theos-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/theos
           key: ${{ runner.os }}-theos-rootless-iphoneos16.5-v1
@@ -76,6 +89,13 @@ jobs:
           test -x "$THEOS/bin/dm.pl"
           echo "Theos commit: $(git -C "$THEOS" rev-parse --short HEAD)"
           echo "iOS SDK: $SDK_DIR"
+
+      - name: Save Theos and iPhoneOS SDK cache
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/theos
+          key: ${{ steps.theos-cache.outputs.cache-primary-key }}
 
       - name: Build AppSync Unified
         shell: bash
