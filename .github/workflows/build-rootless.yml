@@ -1,4 +1,3 @@
-
 name: Build AppSync Unified (Rootless)
 
 on:
@@ -10,22 +9,73 @@ permissions:
 jobs:
   build:
     name: Build iOS Rootless package
-    runs-on: macos-14
+    runs-on: macos-15
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install Theos
+      - name: Cache Theos and iPhoneOS SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/theos
+          key: ${{ runner.os }}-theos-rootless-iphoneos16.5-v1
+
+      - name: Install build prerequisites and prepare Theos
         shell: bash
         run: |
           set -euo pipefail
 
           export THEOS="$HOME/theos"
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          export HOMEBREW_NO_AUTO_UPDATE=1
 
+          echo "=== Xcode ==="
           xcodebuild -version
 
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+          echo "=== Build tools ==="
+          command -v brew
+          if ! command -v ldid >/dev/null 2>&1; then
+            brew install ldid
+          fi
+          if ! command -v xz >/dev/null 2>&1; then
+            brew install xz
+          fi
+          command -v git
+          command -v curl
+          command -v xz
+          command -v ldid
+
+          echo "=== Theos ==="
+          if [[ ! -d "$THEOS/.git" || ! -x "$THEOS/bin/dm.pl" ]]; then
+            rm -rf "$THEOS"
+            git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          else
+            echo "Using cached Theos checkout."
+            git -C "$THEOS" submodule update --init --recursive
+          fi
+
+          mkdir -p "$THEOS/sdks"
+          SDK_DIR="$THEOS/sdks/iPhoneOS16.5.sdk"
+          SDK_ARCHIVE="$RUNNER_TEMP/iPhoneOS16.5.sdk.tar.xz"
+          SDK_URL="https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+
+          if [[ ! -f "$SDK_DIR/SDKSettings.plist" ]]; then
+            echo "Downloading the pinned iPhoneOS 16.5 SDK directly."
+            curl --fail --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 3 \
+              "$SDK_URL" --output "$SDK_ARCHIVE"
+            xz --test "$SDK_ARCHIVE"
+            tar -xJf "$SDK_ARCHIVE" -C "$THEOS/sdks"
+          else
+            echo "Using cached iPhoneOS 16.5 SDK."
+          fi
+
+          test -f "$SDK_DIR/SDKSettings.plist"
+          test -x "$THEOS/bin/dm.pl"
+          echo "Theos commit: $(git -C "$THEOS" rev-parse --short HEAD)"
+          echo "iOS SDK: $SDK_DIR"
 
       - name: Build AppSync Unified
         shell: bash
@@ -33,14 +83,16 @@ jobs:
           set -euo pipefail
 
           export THEOS="$HOME/theos"
-          export PATH="$THEOS/bin:$PATH"
+          export PATH="$THEOS/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+          echo "=== Clean rootless build ==="
           make clean \
             THEOS="$THEOS" \
             THEOS_PACKAGE_SCHEME=rootless \
             TARGET=iphone:clang:latest:15.0 \
             ARCHS="arm64 arm64e"
 
+          echo "=== Compile and package ==="
           make package \
             THEOS="$THEOS" \
             THEOS_PACKAGE_SCHEME=rootless \
@@ -49,25 +101,73 @@ jobs:
             FINALPACKAGE=1 \
             STRIP=0
 
-      - name: Check build output
+      - name: Verify Debian package
         shell: bash
         run: |
           set -euo pipefail
 
+          shopt -s nullglob
           packages=(debs/*.deb)
-
-          if [ "${#packages[@]}" -ne 1 ]; then
-            echo "Expected exactly one .deb package."
+          if [[ "${#packages[@]}" -ne 1 ]]; then
+            echo "Expected exactly one .deb package, found ${#packages[@]}."
             printf '%s\n' "${packages[@]}"
             exit 1
           fi
 
-          echo "Package ready: ${packages[0]}"
+          package="${packages[0]}"
+          members="$(ar -t "$package")"
+          printf '%s\n' "$members"
 
-      - name: Upload Debian package
+          grep -qx 'debian-binary' <<< "$members"
+          control_member="$(grep -E '^control\.tar(\..+)?$' <<< "$members" | head -n 1)"
+          data_member="$(grep -E '^data\.tar(\..+)?$' <<< "$members" | head -n 1)"
+          test -n "$control_member"
+          test -n "$data_member"
+
+          mkdir -p "$RUNNER_TEMP/deb-control"
+          ar -p "$package" "$control_member" > "$RUNNER_TEMP/control.tar"
+          tar -xf "$RUNNER_TEMP/control.tar" -C "$RUNNER_TEMP/deb-control"
+
+          control_file="$(find "$RUNNER_TEMP/deb-control" -type f -name control -print -quit)"
+          test -n "$control_file"
+
+          package_id="$(awk -F': ' '$1 == "Package" { print $2; exit }' "$control_file")"
+          version="$(awk -F': ' '$1 == "Version" { print $2; exit }' "$control_file")"
+          architecture="$(awk -F': ' '$1 == "Architecture" { print $2; exit }' "$control_file")"
+
+          echo "Package: $package_id"
+          echo "Version: $version"
+          echo "Architecture: $architecture"
+
+          test "$package_id" = "ai.akemi.appsyncunified"
+          test "$version" = "118.0"
+          test "$architecture" = "iphoneos-arm64"
+
+          ar -p "$package" "$data_member" > "$RUNNER_TEMP/data.tar"
+          tar -tf "$RUNNER_TEMP/data.tar" > package-content-list.txt
+          if ! grep -Eq '(^|/)var/jb/' package-content-list.txt; then
+            echo "No /var/jb rootless installation paths found in the package."
+            exit 1
+          fi
+
+          {
+            echo "Package: $package"
+            echo "Package ID: $package_id"
+            echo "Version: $version"
+            echo "Architecture: $architecture"
+            echo "SDK: iPhoneOS 16.5"
+            echo "Target: iOS 15.0+"
+            echo "Package scheme: rootless (/var/jb)"
+            echo "Build architectures: arm64 arm64e"
+          } | tee build-summary.txt
+
+      - name: Upload Debian package and build report
         uses: actions/upload-artifact@v4
         with:
           name: AppSync-Unified-118-Rootless
-          path: debs/*.deb
+          path: |
+            debs/*.deb
+            build-summary.txt
+            package-content-list.txt
           if-no-files-found: error
           retention-days: 14
