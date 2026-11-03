@@ -10,7 +10,12 @@ include $(THEOS)/makefiles/common.mk
 SUBPROJECTS += AppSyncUnified-installd
 SUBPROJECTS += AppSyncUnified-FrontBoard
 SUBPROJECTS += pkg-actions
+
+# asu_inject is only used by the legacy 32-bit iOS 9.3.x workaround.
+# Rootless packages target iOS 15+ and do not need this helper.
+ifneq ($(THEOS_PACKAGE_SCHEME),rootless)
 SUBPROJECTS += asu_inject
+endif
 
 include $(THEOS_MAKE_PATH)/aggregate.mk
 
